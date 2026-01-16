@@ -102,7 +102,7 @@ def save_mistakes(mistake_list):
     except: pass
 
 # --- Edge-TTS ---
-async def _edge_tts_save(text, voice="ja-JP-DaichiNeural"):
+async def _edge_tts_save(text, voice="ja-JP-KeitaNeural"):
     try:
         communicate = edge_tts.Communicate(text, voice)
         await communicate.save(TEMP_AUDIO_FILE)
