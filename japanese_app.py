@@ -11,10 +11,12 @@ from io import BytesIO
 import speech_recognition as sr
 from streamlit_mic_recorder import mic_recorder
 import pykakasi 
+from datetime import datetime, timedelta
 
 # --- 設定區 ---
 DATA_FILENAME = 'Phrases.xlsx'
 MISTAKE_FILENAME = 'jp_mistakes.json'
+SRS_DB_FILENAME = 'srs_progress.json' # [新增] 儲存記憶進度
 TEMP_AUDIO_FILE = "temp_jp_voice.mp3"
 
 # --- 1. 資料處理與載入 ---
@@ -35,15 +37,29 @@ def load_data():
         all_sentence_translations = []
         all_vocab_meanings = []
 
+        # 取得今天日期字串，若 Excel Time 空白則預設為今天
+        default_date = datetime.now().strftime("%Y-%m-%d")
+
         for _, row in df.iterrows():
             # 1. 解析句子資料
             s_ja = str(row.get('Sentence', '')).strip()
             s_ch = str(row.get('Translation', '')).strip()
             gid  = str(row.get('Group', '')).strip()
+            # [新增] 讀取 Time 欄位
+            time_str = str(row.get('Time', default_date)).strip()
+            if not time_str: time_str = default_date # 防呆
             
+            # 嘗試正規化日期格式 (簡單處理 YYYY-MM-DD)
+            try:
+                # 如果 Excel 讀入是 datetime 物件
+                if isinstance(row.get('Time'), datetime):
+                    time_str = row.get('Time').strftime("%Y-%m-%d")
+            except:
+                pass
+
             # [修正] 處理 Parsing 欄位：將全形＋轉為半形+，再進行切割
             parsing_raw = str(row.get('Parsing', '')).strip()
-            parsing_raw = parsing_raw.replace('＋', '+') # 關鍵修正：全形轉半形
+            parsing_raw = parsing_raw.replace('＋', '+') 
             
             if s_ja and s_ch:
                 item = {
@@ -51,7 +67,8 @@ def load_data():
                     "sentence": s_ja,
                     "translation": s_ch,
                     "group": gid,
-                    "parsing": [p.strip() for p in parsing_raw.split('+') if p.strip()]
+                    "parsing": [p.strip() for p in parsing_raw.split('+') if p.strip()],
+                    "start_date": time_str # 啟用日期
                 }
                 sentence_data.append(item)
                 all_sentence_translations.append(s_ch)
@@ -79,7 +96,8 @@ def load_data():
                             "type": "vocab",
                             "kanji": kanji.strip(),
                             "reading": reading.strip(),
-                            "meaning": m_items[i]
+                            "meaning": m_items[i],
+                            "start_date": time_str # 單字共用該行的時間
                         }
                         vocab_data.append(v_item)
                         all_vocab_meanings.append(m_items[i])
@@ -89,17 +107,57 @@ def load_data():
         st.error(f"讀取資料失敗: {e}")
         return [], [], {}, []
 
-def load_mistakes():
-    if not os.path.exists(MISTAKE_FILENAME): return []
+# --- JSON 存取 ---
+def load_json(filename):
+    if not os.path.exists(filename): return {} if 'srs' in filename else []
     try:
-        with open(MISTAKE_FILENAME, 'r', encoding='utf-8') as f: return json.load(f)
-    except: return []
+        with open(filename, 'r', encoding='utf-8') as f: return json.load(f)
+    except: return {} if 'srs' in filename else []
 
-def save_mistakes(mistake_list):
+def save_json(filename, data):
     try:
-        with open(MISTAKE_FILENAME, 'w', encoding='utf-8') as f:
-            json.dump(mistake_list, f, ensure_ascii=False, indent=4)
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
     except: pass
+
+# --- SRS 核心演算法 ---
+def update_srs_status(key, is_correct):
+    srs_db = st.session_state.srs_db
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    
+    # 建立初始紀錄
+    if key not in srs_db:
+        srs_db[key] = {
+            "next_review": today_str,
+            "interval": 0,
+            "reps": 0
+        }
+    
+    record = srs_db[key]
+    
+    if is_correct:
+        # 答對：拉長間隔 (Fibonacci-like: 1, 3, 6, 14, 30...)
+        if record["interval"] == 0:
+            record["interval"] = 1
+        elif record["interval"] == 1:
+            record["interval"] = 3
+        else:
+            record["interval"] = int(record["interval"] * 2.2) # 係數可調
+            
+        record["reps"] += 1
+    else:
+        # 答錯：重置，明天立即複習
+        record["interval"] = 0
+        record["reps"] = 0
+    
+    # 計算下次複習日
+    next_date = datetime.now() + timedelta(days=record["interval"])
+    record["next_review"] = next_date.strftime("%Y-%m-%d")
+    
+    srs_db[key] = record
+    save_json(SRS_DB_FILENAME, srs_db)
+    
+    return record["interval"], record["next_review"]
 
 # --- Edge-TTS ---
 async def _edge_tts_save(text, voice="ja-JP-KeitaNeural"):
@@ -168,7 +226,9 @@ if 'initialized' not in st.session_state:
     st.session_state.group_map = g_map
     st.session_state.trans_pool = pools[0]
     st.session_state.meaning_pool = pools[1]
-    st.session_state.mistakes = load_mistakes()
+    
+    st.session_state.mistakes = load_json(MISTAKE_FILENAME)
+    st.session_state.srs_db = load_json(SRS_DB_FILENAME) # 載入 SRS 進度
     
     st.session_state.current_q = None
     st.session_state.mode = None
@@ -184,68 +244,106 @@ if 'initialized' not in st.session_state:
     
     st.session_state.initialized = True
 
-# --- 3. 核心邏輯 ---
+# --- 3. 核心邏輯 (智慧選題) ---
 
 def pick_new_question():
     st.session_state.is_review = False
     st.session_state.selected_indices = [] 
     st.session_state.shuffled_parsing = []
 
-    # 錯題複習
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    srs_db = st.session_state.srs_db
     mistakes = st.session_state.mistakes
-    target_mistake_key = None
+
+    # --- 1. 篩選候選池 ---
+    # 我們將題目分為三類：
+    # A. Due (到期): 在 SRS 系統中，且 next_review <= 今天
+    # B. New (新題): 不在 SRS 系統中，且 Excel Time <= 今天
+    # C. Other (其他): 尚未到期的題目 (如果上述都沒了，才拿來練習)
     
-    if mistakes and random.random() < 0.3:
-        target_mistake_key = random.choice(mistakes)
-        q_item = next((item for item in st.session_state.sentence_data if item['sentence'] == target_mistake_key), None)
-        
-        if not q_item:
-            q_item = next((item for item in st.session_state.vocab_data if item['kanji'] == target_mistake_key), None)
-            
-        if q_item:
-            st.session_state.is_review = True
-            if q_item['type'] == 'sentence':
-                available_review_modes = [1, 2, 3, 5, 6, 9] 
-                mode = random.choice(available_review_modes)
-            else:
-                mode = random.choice([7, 8, 10])
-            setup_question(q_item, mode)
-            return
+    due_items = []
+    new_items = []
+    
+    # 檢查句子
+    for item in st.session_state.sentence_data:
+        key = item['sentence']
+        if key in srs_db:
+            if srs_db[key]['next_review'] <= today_str:
+                due_items.append(item)
         else:
-            mistakes.remove(target_mistake_key)
-            save_mistakes(mistakes)
+            if item['start_date'] <= today_str:
+                new_items.append(item)
+                
+    # 檢查單字
+    for item in st.session_state.vocab_data:
+        key = item['kanji']
+        if key in srs_db:
+            if srs_db[key]['next_review'] <= today_str:
+                due_items.append(item)
+        else:
+            if item['start_date'] <= today_str:
+                new_items.append(item)
 
-    # 一般出題
-    available_modes = []
-    if st.session_state.sentence_data:
-        available_modes.extend([1, 2, 3, 5, 6, 9])
-        valid_groups_count = sum(1 for g in st.session_state.group_map.values() if len(g) >= 2)
-        if valid_groups_count > 0:
-            available_modes.append(4)
-        
-    if st.session_state.vocab_data:
-        available_modes.extend([7, 8, 10])
-        
-    if not available_modes:
-        st.error("沒有資料！請檢查 Excel")
-        return
-
-    mode = random.choice(available_modes)
-    
+    # --- 2. 決定出題優先級 ---
     q_item = None
-    is_vocab_mode = mode in [7, 8, 10]
+    priority_msg = ""
+
+    # Priority 1: 到期複習 (Due)
+    if due_items:
+        q_item = random.choice(due_items)
+        st.session_state.is_review = True
+        priority_msg = "🔥 今日到期 (SRS)"
     
-    if is_vocab_mode:
-        q_item = random.choice(st.session_state.vocab_data)
+    # Priority 2: 錯題本 (Mistakes) - 如果沒有到期的，就清錯題
+    elif mistakes and random.random() < 0.7: # 給錯題高一點的機率
+        target_key = random.choice(mistakes)
+        # 找句子
+        q_item = next((i for i in st.session_state.sentence_data if i['sentence'] == target_key), None)
+        # 找單字
+        if not q_item:
+            q_item = next((i for i in st.session_state.vocab_data if i['kanji'] == target_key), None)
+        
+        # 找不到資料(可能Excel刪了)，清理錯題
+        if not q_item:
+            mistakes.remove(target_key)
+            save_json(MISTAKE_FILENAME, mistakes)
+            pick_new_question()
+            return
+        
+        st.session_state.is_review = True
+        priority_msg = "💀 錯題複習"
+
+    # Priority 3: 新題目 (New)
+    elif new_items:
+        q_item = random.choice(new_items)
+        priority_msg = "✨ 新題目 (Today's New)"
+
+    # Priority 4: 隨機鞏固 (如果今天任務都做完了)
     else:
-        if mode == 4:
-            valid_groups = [g for g, s_list in st.session_state.group_map.items() if len(s_list) >= 2]
-            target_gid = random.choice(valid_groups)
-            target_s_list = st.session_state.group_map[target_gid]
-            question_s = random.choice(target_s_list)
-            q_item = next(item for item in st.session_state.sentence_data if item['sentence'] == question_s)
+        all_pool = st.session_state.sentence_data + st.session_state.vocab_data
+        if all_pool:
+            q_item = random.choice(all_pool)
+            priority_msg = "🎲 隨機練習 (今日任務已清空)"
         else:
-            q_item = random.choice(st.session_state.sentence_data)
+            st.error("沒有資料！請檢查 Excel 內容。")
+            return
+
+    st.session_state.priority_msg = priority_msg # 存下來顯示用
+
+    # --- 3. 決定模式 ---
+    if q_item['type'] == 'sentence':
+        # 檢查是否能用 Mode 4
+        can_use_mode4 = False
+        if q_item['group'] in st.session_state.group_map:
+             if len(st.session_state.group_map[q_item['group']]) >= 2:
+                 can_use_mode4 = True
+        
+        available_modes = [1, 2, 3, 5, 6, 9]
+        if can_use_mode4: available_modes.append(4)
+        mode = random.choice(available_modes)
+    else:
+        # 單字
+        mode = random.choice([7, 8, 10])
 
     setup_question(q_item, mode)
 
@@ -306,7 +404,6 @@ def setup_question(q_item, mode):
         
     # Parsing (Mode 6)
     if mode == 6:
-        # 修正：確保如果有解析不到的情況，至少整句當作一個塊，避免錯誤
         if not q_item['parsing']:
             raw_parts = [q_item['sentence']]
         else:
@@ -329,8 +426,6 @@ def deselect_block(idx):
 def submit_parsing_answer():
     indices = st.session_state.selected_indices
     lookup = {item['id']: item['text'] for item in st.session_state.shuffled_parsing}
-    
-    # 按照使用者順序組字
     user_sentence = "".join([lookup[i] for i in indices])
     check_answer(user_sentence)
 
@@ -378,25 +473,28 @@ def check_answer(user_input):
         is_correct_flag = (user_clean == str(target).replace(" ", ""))
         
     else:
-        # 寬容比對：去標點 + 轉平假名
         def clean_chars(t): 
             return re.sub(r'[。、？！\?!\s　]', '', str(t))
         
         user_hira = get_hiragana(clean_chars(user_input))
         target_hira = get_hiragana(clean_chars(target))
-        
         is_correct_flag = (user_hira == target_hira)
 
-    mistake_key = item['sentence'] if item['type'] == 'sentence' else item['kanji']
+    # === [關鍵] 更新 SRS 與 錯題本 ===
+    key = item['sentence'] if item['type'] == 'sentence' else item['kanji']
     
+    # 1. 更新記憶曲線
+    new_interval, next_review_date = update_srs_status(key, is_correct_flag)
+    
+    # 2. 更新錯題本 (答錯一定進錯題本，答對則移出)
     if is_correct_flag:
-        if mistake_key in st.session_state.mistakes:
-            st.session_state.mistakes.remove(mistake_key)
-            save_mistakes(st.session_state.mistakes)
+        if key in st.session_state.mistakes:
+            st.session_state.mistakes.remove(key)
+            save_json(MISTAKE_FILENAME, st.session_state.mistakes)
     else:
-        if mistake_key not in st.session_state.mistakes:
-            st.session_state.mistakes.append(mistake_key)
-            save_mistakes(st.session_state.mistakes)
+        if key not in st.session_state.mistakes:
+            st.session_state.mistakes.append(key)
+            save_json(MISTAKE_FILENAME, st.session_state.mistakes)
 
     # 詳細回饋
     if item['type'] == 'sentence':
@@ -409,11 +507,11 @@ def check_answer(user_input):
     detail_html = f"""
     \n🇯🇵 日文： {detail_jp}
     \n🇹🇼 中文： {detail_ch}
+    \n📅 下次複習: {next_review_date} (間隔: {new_interval} 天)
     """
 
     if is_correct_flag:
-        msg = "正解！答對了"
-        if st.session_state.is_review: msg += " (錯題複習成功！已移除 🎉)"
+        msg = "正解！答對了！ 🎉"
         msg += detail_html
         st.session_state.feedback = {"type": "success", "msg": msg}
     else:
@@ -438,15 +536,36 @@ def check_answer(user_input):
 st.set_page_config(page_title="日本語特訓", page_icon="🇯🇵")
 
 with st.sidebar:
-    st.header("📊 學習狀況")
-    st.metric("💀 累積錯題", f"{len(st.session_state.mistakes)} 題")
+    st.header("🧠 記憶中樞 (SRS)")
+    
+    # 計算統計數據
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    srs_db = st.session_state.srs_db
+    
+    # 計算今日到期數
+    due_count = sum(1 for k, v in srs_db.items() if v['next_review'] <= today_str)
+    
+    # 計算今日新單字 (Excel Time <= Today 且不在 SRS DB 中)
+    # 這邊簡單估算，實際遍歷比較準
+    new_count = 0
+    all_keys = set(srs_db.keys())
+    for item in st.session_state.sentence_data:
+        if item['sentence'] not in all_keys and item['start_date'] <= today_str:
+            new_count += 1
+    for item in st.session_state.vocab_data:
+        if item['kanji'] not in all_keys and item['start_date'] <= today_str:
+            new_count += 1
+
+    st.metric("🔥 今日需複習 (Due)", f"{due_count} 題")
+    st.metric("✨ 今日新進度 (New)", f"{new_count} 題")
+    st.metric("💀 錯題本 (Mistakes)", f"{len(st.session_state.mistakes)} 題")
     
     with st.expander("管理錯題"):
         if st.session_state.mistakes:
             st.write(st.session_state.mistakes)
             if st.button("清空錯題本"):
                 st.session_state.mistakes = []
-                save_mistakes([])
+                save_json(MISTAKE_FILENAME, [])
                 st.rerun()
         else:
             st.write("目前沒有錯題！")
@@ -457,7 +576,8 @@ with st.sidebar:
         st.session_state.initialized = False
         st.rerun()
 
-st.title("🇯🇵 日本語全能特訓")
+st.title("🇯🇵 日本語智慧特訓")
+st.caption("基於遺忘曲線的 SRS 學習系統")
 
 if st.session_state.current_q is None:
     pick_new_question()
@@ -465,11 +585,9 @@ if st.session_state.current_q is None:
 q = st.session_state.current_q
 mode = st.session_state.mode
 
-mode_text = f"Mode {mode}"
-if st.session_state.is_review:
-    st.warning(f"💀 錯題複習中 - {mode_text}")
-else:
-    st.info(f"✨ 新題目 - {mode_text}")
+# 顯示出題原因
+tag_text = st.session_state.get("priority_msg", "New")
+st.info(f"{tag_text} | Mode {mode}")
 
 col1, col2 = st.columns([1, 4])
 
@@ -491,7 +609,7 @@ with col2:
             st.audio(st.session_state.audio_data, format='audio/mpeg')
     elif mode == 6: 
         st.markdown(f"### {q['translation']}")
-        st.write("請重組句子 (點選下方字卡)：")
+        st.write("請重組句子：")
     elif mode == 7: 
         st.markdown(f"### {q['kanji']}")
         st.caption(f"意思: {q['meaning']}")
@@ -504,7 +622,7 @@ with col2:
         st.caption(f"意思: {q['translation']}")
     elif mode == 10: 
         st.markdown(f"### {q['kanji']}")
-        st.caption(f"讀音: {q['reading']} | 意思: {q['meaning']}")
+        # st.caption(f"讀音: {q['reading']} | 意思: {q['meaning']}")
 
 st.divider()
 
@@ -552,7 +670,6 @@ elif mode == 6:
     selected_ids = st.session_state.selected_indices
     lookup = {item['id']: item['text'] for item in all_blocks}
     
-    # 1. 答案區
     st.write("⬇️ **點擊字卡來移除 (復原)**")
     with st.container(border=True):
         if not selected_ids:
@@ -567,7 +684,6 @@ elif mode == 6:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # 2. 選項區
     st.write("⬇️ **點擊字卡來選擇**")
     available_blocks = [b for b in all_blocks if b['id'] not in selected_ids]
     
