@@ -246,12 +246,12 @@ def generate_diff(user_text, target_text):
     s = difflib.SequenceMatcher(None, user_text, target_text)
     html = []
     for opcode, a0, a1, b0, b1 in s.get_opcodes():
-        if opcode == 'equal': html.append(f"<span style='color:green; font-weight:bold'>{target_text[b0:b1]}</span>")
-        elif opcode == 'insert': html.append(f"<span style='color:red; text-decoration:underline; background-color:#ffe6e6'>[{target_text[b0:b1]}]</span>")
-        elif opcode == 'delete': html.append(f"<span style='color:gray; text-decoration:line-through'>{user_text[a0:a1]}</span>")
+        if opcode == 'equal': html.append(f"{target_text[b0:b1]}")
+        elif opcode == 'insert': html.append(f"[{target_text[b0:b1]}]")
+        elif opcode == 'delete': html.append(f"{user_text[a0:a1]}")
         elif opcode == 'replace':
-            html.append(f"<span style='color:gray; text-decoration:line-through'>{user_text[a0:a1]}</span>")
-            html.append(f"<span style='color:red; background-color:#ffe6e6'>[{target_text[b0:b1]}]</span>")
+            html.append(f"{user_text[a0:a1]}")
+            html.append(f"[{target_text[b0:b1]}]")
     return "".join(html)
 
 def transcribe_audio_bytes(audio_bytes):
@@ -437,7 +437,7 @@ def check_answer(user_input):
 
     # 產生回饋訊息
     msg_type = "success" if is_correct else "error"
-    msg_header = "🎉 正解！" if is_correct else f"❌ 残念... 正解: {target}"
+    msg_header = "🎉 正解！" if is_correct else f"残念... 正解: {target}"
     
     detail_html = f"""
     📅 下次複習: {next_review_date} (間隔: {new_interval} 天)
