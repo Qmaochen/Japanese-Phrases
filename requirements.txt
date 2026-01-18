@@ -1,6 +1,6 @@
 streamlit
+st-gsheets-connection
 pandas
-openpyxl
 edge-tts
 SpeechRecognition
 streamlit-mic-recorder
