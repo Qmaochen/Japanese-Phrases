@@ -578,10 +578,42 @@ else: # 打字
             st.rerun()
 
 # 回饋區
+# --- 回饋區 (修改版) ---
 if st.session_state.feedback:
     fb = st.session_state.feedback
-    if fb['type'] == 'success': st.success(fb['msg'], icon="✅")
-    else: st.error(fb['msg'], icon="❌")
     
-    if st.session_state.audio_data: st.audio(st.session_state.audio_data, format='audio/mpeg')
-    st.button("👉 下一題", on_click=pick_new_question, type="primary")
+    # 1. 顯示答題結果 (綠色/紅色橫幅)
+    if fb['type'] == 'success': 
+        st.success(fb['msg'], icon="✅")
+    else: 
+        st.error(fb['msg'], icon="❌")
+    
+    # 2. 顯示完整詳解 (日文 + 中文 + 音檔)
+    with st.container(border=True):
+        st.caption("📖 題目詳解")
+        
+        q_item = st.session_state.current_q
+        
+        # 根據題目類型顯示不同資訊
+        col_text, col_audio = st.columns([3, 1])
+        
+        with col_text:
+            if q_item['type'] == 'sentence':
+                st.markdown(f"**🇯🇵 日文：**\n### {q_item['sentence']}")
+                st.markdown(f"**🇹🇼 中文：** {q_item['translation']}")
+                # 如果有 parsing 資料也可以顯示，沒有則略過
+                if q_item.get('parsing'):
+                    st.caption(f"結構: {' | '.join(q_item['parsing'])}")
+            else:
+                # 單字題型
+                st.markdown(f"**🇯🇵 單字：**\n### {q_item['kanji']}")
+                st.markdown(f"**🗣️ 讀音：** {q_item['reading']}")
+                st.markdown(f"**🇹🇼 意思：** {q_item['meaning']}")
+
+        with col_audio:
+            if st.session_state.audio_data:
+                st.write("🔊 發音")
+                st.audio(st.session_state.audio_data, format='audio/mpeg')
+
+    # 3. 下一題按鈕
+    st.button("👉 下一題", on_click=pick_new_question, type="primary", use_container_width=True)
