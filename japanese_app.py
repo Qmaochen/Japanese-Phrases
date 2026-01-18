@@ -371,7 +371,8 @@ def setup_question(q_item, mode):
     
     # Audio
     if mode in [3, 5, 8, 9, 10]:
-        text_to_speak = q_item['kanji'] if is_vocab_mode else q_item['sentence']
+        # 修改後：如果是單字模式，讀取 reading (平假名)
+        text_to_speak = q_item['reading'] if is_vocab_mode else q_item['sentence']
         st.session_state.audio_data = get_audio_bytes(text_to_speak)
         
     # Options Generation (略為簡化，與原邏輯相同)
@@ -439,8 +440,8 @@ def check_answer(user_input):
     msg_header = "🎉 正解！" if is_correct else f"❌ 残念... 正解: {target}"
     
     detail_html = f"""
-    <br>📅 下次複習: {next_review_date} (間隔: {new_interval} 天)
-    <br>💾 已同步至 Google Sheets
+    📅 下次複習: {next_review_date} (間隔: {new_interval} 天)
+    \n💾 已同步至 Google Sheets
     """
     
     st.session_state.feedback = {"type": msg_type, "msg": msg_header + detail_html}
@@ -450,7 +451,8 @@ def check_answer(user_input):
         st.session_state.feedback["msg"] += f"<br>差異: {generate_diff(str(user_input), str(target))}"
 
     # 播放正確語音
-    speak_text = item['kanji'] if (mode in [7,8,10]) else item['sentence']
+    # 修改後：單字題讀取 reading
+    speak_text = item['reading'] if (mode in [7,8,10]) else item['sentence']
     st.session_state.audio_data = get_audio_bytes(speak_text)
 
 # --- Mode 6 輔助 ---
